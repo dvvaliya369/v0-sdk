@@ -74,15 +74,19 @@ export function useChat(chatId: string) {
         },
       ])
 
-      // Start streaming the assistant response
+      // Start streaming the assistant response - clone the stream to avoid locking issues
       setIsStreaming(true)
+
+      // Use the stream directly without storing reference to avoid lock conflicts
+      const streamToUse = handoff.stream
+
       setChatHistory((prev) => [
         ...prev,
         {
           type: 'assistant',
           content: [],
           isStreaming: true,
-          stream: handoff.stream,
+          stream: streamToUse,
         },
       ])
 

@@ -88,13 +88,18 @@ class StreamStateManager {
       return
     }
 
+    // Mark stream as processed first to prevent retries
+    this.processedStreams.add(stream)
+
     // Handle locked streams gracefully
     if (stream.locked) {
       console.warn('Stream is locked, cannot process')
+      const errorMessage = 'Stream is already being read by another consumer'
+      this.setError(errorMessage)
+      options.onError?.(errorMessage)
       return
     }
 
-    this.processedStreams.add(stream)
     this.reset()
     this.setStreaming(true)
 
@@ -244,11 +249,15 @@ export function useStreamingMessage(
 
   // Process stream when it changes
   const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
+  const isProcessingRef = useRef<boolean>(false)
 
-  if (stream !== lastStreamRef.current) {
+  if (stream !== lastStreamRef.current && !isProcessingRef.current) {
     lastStreamRef.current = stream
     if (stream) {
-      manager.processStream(stream, options)
+      isProcessingRef.current = true
+      manager.processStream(stream, options).finally(() => {
+        isProcessingRef.current = false
+      })
     }
   }
 
