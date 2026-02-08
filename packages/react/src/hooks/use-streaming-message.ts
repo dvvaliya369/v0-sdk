@@ -88,9 +88,10 @@ class StreamStateManager {
       return
     }
 
-    // Handle locked streams gracefully
+    // Check if stream is locked (but only warn if we haven't processed it yet)
+    // This prevents spurious warnings during React re-renders
     if (stream.locked) {
-      console.warn('Stream is locked, cannot process')
+      console.debug('Stream is already locked, skipping processing')
       return
     }
 
@@ -244,11 +245,15 @@ export function useStreamingMessage(
 
   // Process stream when it changes
   const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
+  const processingRef = useRef(false)
 
   if (stream !== lastStreamRef.current) {
     lastStreamRef.current = stream
-    if (stream) {
-      manager.processStream(stream, options)
+    if (stream && !processingRef.current) {
+      processingRef.current = true
+      manager.processStream(stream, options).finally(() => {
+        processingRef.current = false
+      })
     }
   }
 
