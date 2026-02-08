@@ -216,6 +216,9 @@ export function HomeClient() {
 
       setIsLoading(false)
 
+      // Clone the stream to prevent locking issues if component re-renders
+      const [stream1, stream2] = response.body.tee()
+
       // Add streaming assistant response
       setChatHistory((prev) => [
         ...prev,
@@ -223,7 +226,7 @@ export function HomeClient() {
           type: 'assistant',
           content: [],
           isStreaming: true,
-          stream: response.body,
+          stream: stream1,
         },
       ])
     } catch (error) {
@@ -387,6 +390,9 @@ export function HomeClient() {
 
       setIsLoading(false)
 
+      // Clone the stream to prevent locking issues if component re-renders
+      const [stream1, stream2] = response.body.tee()
+
       // Add streaming response
       setChatHistory((prev) => [
         ...prev,
@@ -394,7 +400,7 @@ export function HomeClient() {
           type: 'assistant',
           content: [],
           isStreaming: true,
-          stream: response.body,
+          stream: stream1,
         },
       ])
     } catch (error) {

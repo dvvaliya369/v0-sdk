@@ -65,6 +65,9 @@ export function useChat(chatId: string) {
     if (handoff.chatId === chatId && handoff.stream && handoff.userMessage) {
       console.log('Continuing streaming from context for chat:', chatId)
 
+      // Clone the stream to prevent locking issues if component re-renders
+      const [stream1, stream2] = handoff.stream.tee()
+
       // Add the user message to chat history
       setChatHistory((prev) => [
         ...prev,
@@ -82,7 +85,7 @@ export function useChat(chatId: string) {
           type: 'assistant',
           content: [],
           isStreaming: true,
-          stream: handoff.stream,
+          stream: stream1,
         },
       ])
 
@@ -148,6 +151,9 @@ export function useChat(chatId: string) {
       setIsStreaming(true)
       // Keep isLoading true until streaming message has content
 
+      // Clone the stream to prevent locking issues if component re-renders
+      const [stream1, stream2] = response.body.tee()
+
       // Add placeholder for streaming response with the stream attached
       setChatHistory((prev) => [
         ...prev,
@@ -155,7 +161,7 @@ export function useChat(chatId: string) {
           type: 'assistant',
           content: [],
           isStreaming: true,
-          stream: response.body,
+          stream: stream1,
         },
       ])
     } catch (error) {

@@ -88,9 +88,11 @@ class StreamStateManager {
       return
     }
 
-    // Handle locked streams gracefully
+    // Handle locked streams gracefully - if a stream is locked, it means
+    // it's already being processed. Mark it as processed to prevent retries.
     if (stream.locked) {
-      console.warn('Stream is locked, cannot process')
+      console.warn('Stream is locked, marking as already processed')
+      this.processedStreams.add(stream)
       return
     }
 
