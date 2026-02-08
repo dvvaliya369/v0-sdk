@@ -88,12 +88,14 @@ class StreamStateManager {
       return
     }
 
-    // Handle locked streams gracefully
+    // Handle locked streams gracefully - stream is already being processed
+    // This can happen during React re-renders or in Strict Mode
     if (stream.locked) {
-      console.warn('Stream is locked, cannot process')
+      // Don't warn - this is expected behavior when stream is already being read
       return
     }
 
+    // Mark stream as processed before starting to prevent race conditions
     this.processedStreams.add(stream)
     this.reset()
     this.setStreaming(true)
@@ -142,12 +144,14 @@ class StreamStateManager {
     stream: ReadableStream<Uint8Array>,
     options: UseStreamingMessageOptions,
   ): Promise<void> => {
-    const reader = stream.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let currentContent: MessageBinaryFormat = []
-
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    
     try {
+      reader = stream.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let currentContent: MessageBinaryFormat = []
+
       while (true) {
         const { done, value } = await reader.read()
         if (done) {
@@ -214,8 +218,19 @@ class StreamStateManager {
 
       this.setComplete(true)
       options.onComplete?.(currentContent)
+    } catch (error) {
+      // Re-throw to be caught by processStream
+      throw error
     } finally {
-      reader.releaseLock()
+      // Ensure reader is always released, even if an error occurs
+      if (reader) {
+        try {
+          reader.releaseLock()
+        } catch (e) {
+          // Ignore errors when releasing lock (stream might already be closed)
+          console.debug('Error releasing stream lock:', e)
+        }
+      }
     }
   }
 }
@@ -244,11 +259,15 @@ export function useStreamingMessage(
 
   // Process stream when it changes
   const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
+  const processingRef = useRef(false)
 
   if (stream !== lastStreamRef.current) {
     lastStreamRef.current = stream
-    if (stream) {
-      manager.processStream(stream, options)
+    if (stream && !processingRef.current) {
+      processingRef.current = true
+      manager.processStream(stream, options).finally(() => {
+        processingRef.current = false
+      })
     }
   }
 
