@@ -1,4 +1,4 @@
-import { useRef, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useSyncExternalStore } from 'react'
 import { MessageBinaryFormat } from '../types'
 import * as jsondiffpatch from 'jsondiffpatch'
 
@@ -50,8 +50,8 @@ class StreamStateManager {
   private error?: string
   private isComplete: boolean = false
   private callbacks = new Set<() => void>()
-  private processedStreams = new WeakSet<ReadableStream<Uint8Array>>()
   private cachedState: StreamingMessageState | null = null
+  private abortController: AbortController | null = null
 
   subscribe = (callback: () => void) => {
     this.callbacks.add(callback)
@@ -81,12 +81,10 @@ class StreamStateManager {
 
   processStream = async (
     stream: ReadableStream<Uint8Array>,
-    options: UseStreamingMessageOptions = {},
+    optionsRef: { current: UseStreamingMessageOptions },
   ): Promise<void> => {
-    // Prevent processing the same stream multiple times
-    if (this.processedStreams.has(stream)) {
-      return
-    }
+    // Abort any in-progress stream processing before starting a new one
+    this.cancel()
 
     // Handle locked streams gracefully
     if (stream.locked) {
@@ -94,19 +92,34 @@ class StreamStateManager {
       return
     }
 
-    this.processedStreams.add(stream)
+    const abortController = new AbortController()
+    this.abortController = abortController
+
     this.reset()
     this.setStreaming(true)
 
     try {
-      await this.readStream(stream, options)
+      await this.readStream(stream, optionsRef, abortController.signal)
     } catch (err) {
+      // Don't report errors from intentional cancellation
+      if (abortController.signal.aborted) {
+        return
+      }
       const errorMessage =
         err instanceof Error ? err.message : 'Unknown streaming error'
       this.setError(errorMessage)
-      options.onError?.(errorMessage)
+      optionsRef.current.onError?.(errorMessage)
     } finally {
-      this.setStreaming(false)
+      if (!abortController.signal.aborted) {
+        this.setStreaming(false)
+      }
+    }
+  }
+
+  cancel = () => {
+    if (this.abortController) {
+      this.abortController.abort()
+      this.abortController = null
     }
   }
 
@@ -140,7 +153,8 @@ class StreamStateManager {
 
   private readStream = async (
     stream: ReadableStream<Uint8Array>,
-    options: UseStreamingMessageOptions,
+    optionsRef: { current: UseStreamingMessageOptions },
+    signal: AbortSignal,
   ): Promise<void> => {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
@@ -149,9 +163,19 @@ class StreamStateManager {
 
     try {
       while (true) {
+        // Check for cancellation before each read
+        if (signal.aborted) {
+          return
+        }
+
         const { done, value } = await reader.read()
         if (done) {
           break
+        }
+
+        // Check for cancellation after each read
+        if (signal.aborted) {
+          return
         }
 
         const chunk = decoder.decode(value, { stream: true })
@@ -170,7 +194,7 @@ class StreamStateManager {
             jsonData = line.slice(6) // Remove "data: " prefix
             if (jsonData === '[DONE]') {
               this.setComplete(true)
-              options.onComplete?.(currentContent)
+              optionsRef.current.onComplete?.(currentContent)
               return
             }
           } else {
@@ -187,14 +211,14 @@ class StreamStateManager {
               continue
             } else if (parsedData.type === 'done') {
               this.setComplete(true)
-              options.onComplete?.(currentContent)
+              optionsRef.current.onComplete?.(currentContent)
               return
             } else if (
               parsedData.object &&
               parsedData.object.startsWith('chat')
             ) {
               // Handle chat metadata messages (chat, chat.title, chat.name, etc.)
-              options.onChatData?.(parsedData)
+              optionsRef.current.onChatData?.(parsedData)
               continue
             } else if (parsedData.delta) {
               // Apply the delta using jsondiffpatch
@@ -204,7 +228,7 @@ class StreamStateManager {
                 : []
 
               this.updateContent(currentContent)
-              options.onChunk?.(currentContent)
+              optionsRef.current.onChunk?.(currentContent)
             }
           } catch (e) {
             console.warn('Failed to parse streaming data:', line, e)
@@ -213,7 +237,7 @@ class StreamStateManager {
       }
 
       this.setComplete(true)
-      options.onComplete?.(currentContent)
+      optionsRef.current.onComplete?.(currentContent)
     } finally {
       reader.releaseLock()
     }
@@ -235,6 +259,11 @@ export function useStreamingMessage(
 
   const manager = managerRef.current
 
+  // Keep options in a ref so the stream processor always uses the latest callbacks
+  // without needing to restart processing when callbacks change
+  const optionsRef = useRef<UseStreamingMessageOptions>(options)
+  optionsRef.current = options
+
   // Subscribe to state changes using useSyncExternalStore
   const state = useSyncExternalStore(
     manager.subscribe,
@@ -242,15 +271,20 @@ export function useStreamingMessage(
     manager.getState,
   )
 
-  // Process stream when it changes
-  const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
-
-  if (stream !== lastStreamRef.current) {
-    lastStreamRef.current = stream
-    if (stream) {
-      manager.processStream(stream, options)
+  // Process stream inside useEffect to avoid race conditions with React Strict Mode
+  // and concurrent rendering. The cleanup function cancels in-progress reads when
+  // the stream changes or the component unmounts.
+  useEffect(() => {
+    if (!stream) {
+      return
     }
-  }
+
+    manager.processStream(stream, optionsRef)
+
+    return () => {
+      manager.cancel()
+    }
+  }, [stream, manager])
 
   return state
 }

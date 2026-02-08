@@ -28,6 +28,21 @@ declare global {
     new <R = any>(): ReadableStream<R>
   }
 
+  // Abort API types for cancellation support
+  interface AbortSignal {
+    readonly aborted: boolean
+  }
+
+  interface AbortController {
+    readonly signal: AbortSignal
+    abort(): void
+  }
+
+  var AbortController: {
+    prototype: AbortController
+    new (): AbortController
+  }
+
   // Text encoding/decoding
   interface TextDecoder {
     decode(input?: BufferSource, options?: TextDecodeOptions): string
