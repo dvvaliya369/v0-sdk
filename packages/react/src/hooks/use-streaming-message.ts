@@ -1,4 +1,4 @@
-import { useRef, useSyncExternalStore } from 'react'
+import { useRef, useEffect, useSyncExternalStore } from 'react'
 import { MessageBinaryFormat } from '../types'
 import * as jsondiffpatch from 'jsondiffpatch'
 
@@ -52,6 +52,8 @@ class StreamStateManager {
   private callbacks = new Set<() => void>()
   private processedStreams = new WeakSet<ReadableStream<Uint8Array>>()
   private cachedState: StreamingMessageState | null = null
+  private abortController: AbortController | null = null
+  private currentReader: ReadableStreamDefaultReader<Uint8Array> | null = null
 
   subscribe = (callback: () => void) => {
     this.callbacks.add(callback)
@@ -79,6 +81,23 @@ class StreamStateManager {
     return this.cachedState
   }
 
+  cancel = () => {
+    // Abort the current stream processing
+    if (this.abortController) {
+      this.abortController.abort()
+      this.abortController = null
+    }
+    // Cancel the reader if it's still active
+    if (this.currentReader) {
+      try {
+        this.currentReader.cancel()
+      } catch {
+        // Reader may already be released, ignore
+      }
+      this.currentReader = null
+    }
+  }
+
   processStream = async (
     stream: ReadableStream<Uint8Array>,
     options: UseStreamingMessageOptions = {},
@@ -94,19 +113,29 @@ class StreamStateManager {
       return
     }
 
+    // Cancel any previous stream processing
+    this.cancel()
+
     this.processedStreams.add(stream)
+    this.abortController = new AbortController()
     this.reset()
     this.setStreaming(true)
 
     try {
-      await this.readStream(stream, options)
+      await this.readStream(stream, options, this.abortController.signal)
     } catch (err) {
+      // Don't report abort errors as real errors
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return
+      }
       const errorMessage =
         err instanceof Error ? err.message : 'Unknown streaming error'
       this.setError(errorMessage)
       options.onError?.(errorMessage)
     } finally {
       this.setStreaming(false)
+      this.currentReader = null
+      this.abortController = null
     }
   }
 
@@ -141,17 +170,29 @@ class StreamStateManager {
   private readStream = async (
     stream: ReadableStream<Uint8Array>,
     options: UseStreamingMessageOptions,
+    signal: AbortSignal,
   ): Promise<void> => {
     const reader = stream.getReader()
+    this.currentReader = reader
     const decoder = new TextDecoder()
     let buffer = ''
     let currentContent: MessageBinaryFormat = []
 
     try {
       while (true) {
+        // Check if aborted before each read
+        if (signal.aborted) {
+          return
+        }
+
         const { done, value } = await reader.read()
         if (done) {
           break
+        }
+
+        // Check if aborted after each read
+        if (signal.aborted) {
+          return
         }
 
         const chunk = decoder.decode(value, { stream: true })
@@ -212,10 +253,14 @@ class StreamStateManager {
         }
       }
 
-      this.setComplete(true)
-      options.onComplete?.(currentContent)
+      // Only mark complete if not aborted
+      if (!signal.aborted) {
+        this.setComplete(true)
+        options.onComplete?.(currentContent)
+      }
     } finally {
       reader.releaseLock()
+      this.currentReader = null
     }
   }
 }
@@ -235,6 +280,10 @@ export function useStreamingMessage(
 
   const manager = managerRef.current
 
+  // Keep options in a ref so processStream always uses the latest callbacks
+  const optionsRef = useRef(options)
+  optionsRef.current = options
+
   // Subscribe to state changes using useSyncExternalStore
   const state = useSyncExternalStore(
     manager.subscribe,
@@ -242,15 +291,30 @@ export function useStreamingMessage(
     manager.getState,
   )
 
-  // Process stream when it changes
-  const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
-
-  if (stream !== lastStreamRef.current) {
-    lastStreamRef.current = stream
-    if (stream) {
-      manager.processStream(stream, options)
+  // Process stream in useEffect to avoid side effects during render.
+  // This prevents issues with React Strict Mode double-rendering
+  // which was causing "Stream is locked, cannot process" warnings.
+  useEffect(() => {
+    if (!stream) {
+      return
     }
-  }
+
+    // Use a proxy options object that always delegates to the latest ref
+    // so callbacks are never stale during long-running streams
+    const latestOptions: UseStreamingMessageOptions = {
+      onChunk: (...args) => optionsRef.current.onChunk?.(...args),
+      onComplete: (...args) => optionsRef.current.onComplete?.(...args),
+      onError: (...args) => optionsRef.current.onError?.(...args),
+      onChatData: (...args) => optionsRef.current.onChatData?.(...args),
+    }
+
+    manager.processStream(stream, latestOptions)
+
+    return () => {
+      // Cancel stream processing on cleanup (unmount or stream change)
+      manager.cancel()
+    }
+  }, [stream, manager])
 
   return state
 }

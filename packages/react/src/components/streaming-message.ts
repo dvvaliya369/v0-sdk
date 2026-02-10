@@ -58,22 +58,23 @@ export function useStreamingMessageData({
     onChatData,
   })
 
-  const messageData =
-    streamingState.content.length > 0
-      ? useMessage({
-          content: streamingState.content,
-          messageId,
-          role,
-          streaming: streamingState.isStreaming,
-          isLastMessage: true,
-          components,
-          renderers,
-        })
-      : null
+  // Always call useMessage unconditionally to satisfy React's Rules of Hooks.
+  // When there's no content yet, pass an empty array so the hook runs but
+  // produces no meaningful output.
+  const hasContent = streamingState.content.length > 0
+  const messageData = useMessage({
+    content: hasContent ? streamingState.content : ([] as any),
+    messageId,
+    role,
+    streaming: streamingState.isStreaming,
+    isLastMessage: true,
+    components,
+    renderers,
+  })
 
   return {
     ...streamingState,
-    messageData,
+    messageData: hasContent ? messageData : null,
   }
 }
 
