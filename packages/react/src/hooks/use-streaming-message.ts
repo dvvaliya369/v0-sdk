@@ -1,4 +1,4 @@
-import { useRef, useSyncExternalStore } from 'react'
+import { useRef, useEffect, useSyncExternalStore } from 'react'
 import { MessageBinaryFormat } from '../types'
 import * as jsondiffpatch from 'jsondiffpatch'
 
@@ -43,6 +43,21 @@ export interface UseStreamingMessageOptions {
   onChatData?: (chatData: any) => void
 }
 
+/**
+ * Simple cancellation token that avoids the need for DOM AbortController types.
+ */
+class CancelToken {
+  private _cancelled = false
+
+  get cancelled(): boolean {
+    return this._cancelled
+  }
+
+  cancel(): void {
+    this._cancelled = true
+  }
+}
+
 // Stream state manager - isolated from React lifecycle
 class StreamStateManager {
   private content: MessageBinaryFormat = []
@@ -50,8 +65,9 @@ class StreamStateManager {
   private error?: string
   private isComplete: boolean = false
   private callbacks = new Set<() => void>()
-  private processedStreams = new WeakSet<ReadableStream<Uint8Array>>()
   private cachedState: StreamingMessageState | null = null
+  private activeStream: ReadableStream<Uint8Array> | null = null
+  private cancelToken: CancelToken | null = null
 
   subscribe = (callback: () => void) => {
     this.callbacks.add(callback)
@@ -83,31 +99,57 @@ class StreamStateManager {
     stream: ReadableStream<Uint8Array>,
     options: UseStreamingMessageOptions = {},
   ): Promise<void> => {
-    // Prevent processing the same stream multiple times
-    if (this.processedStreams.has(stream)) {
+    // If this exact stream is already being actively processed, skip
+    if (this.activeStream === stream) {
       return
     }
 
-    // Handle locked streams gracefully
+    // Cancel any in-progress stream read before starting a new one
+    this.abort()
+
+    // Handle locked streams with an error state so the UI is not stuck
     if (stream.locked) {
-      console.warn('Stream is locked, cannot process')
+      this.setError(
+        'Stream is locked and cannot be processed. Please try sending your message again.',
+      )
       return
     }
 
-    this.processedStreams.add(stream)
+    this.activeStream = stream
+    const token = new CancelToken()
+    this.cancelToken = token
+
     this.reset()
     this.setStreaming(true)
 
     try {
-      await this.readStream(stream, options)
+      await this.readStream(stream, options, token)
     } catch (err) {
+      // Don't report errors from intentional cancellations
+      if (token.cancelled) {
+        return
+      }
       const errorMessage =
         err instanceof Error ? err.message : 'Unknown streaming error'
       this.setError(errorMessage)
       options.onError?.(errorMessage)
     } finally {
-      this.setStreaming(false)
+      if (!token.cancelled) {
+        this.setStreaming(false)
+        this.activeStream = null
+      }
     }
+  }
+
+  /**
+   * Cancel any in-progress stream reading. Safe to call multiple times.
+   */
+  abort = () => {
+    if (this.cancelToken) {
+      this.cancelToken.cancel()
+      this.cancelToken = null
+    }
+    this.activeStream = null
   }
 
   private reset = () => {
@@ -125,6 +167,8 @@ class StreamStateManager {
 
   private setError = (error: string) => {
     this.error = error
+    this.isStreaming = false
+    this.isComplete = false
     this.notifySubscribers()
   }
 
@@ -141,6 +185,7 @@ class StreamStateManager {
   private readStream = async (
     stream: ReadableStream<Uint8Array>,
     options: UseStreamingMessageOptions,
+    token: CancelToken,
   ): Promise<void> => {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
@@ -149,9 +194,19 @@ class StreamStateManager {
 
     try {
       while (true) {
+        // Check for cancellation before each read
+        if (token.cancelled) {
+          return
+        }
+
         const { done, value } = await reader.read()
         if (done) {
           break
+        }
+
+        // Check for cancellation after each read
+        if (token.cancelled) {
+          return
         }
 
         const chunk = decoder.decode(value, { stream: true })
@@ -212,8 +267,10 @@ class StreamStateManager {
         }
       }
 
-      this.setComplete(true)
-      options.onComplete?.(currentContent)
+      if (!token.cancelled) {
+        this.setComplete(true)
+        options.onComplete?.(currentContent)
+      }
     } finally {
       reader.releaseLock()
     }
@@ -235,6 +292,10 @@ export function useStreamingMessage(
 
   const manager = managerRef.current
 
+  // Keep a stable ref to options so the useEffect does not re-fire on every render
+  const optionsRef = useRef(options)
+  optionsRef.current = options
+
   // Subscribe to state changes using useSyncExternalStore
   const state = useSyncExternalStore(
     manager.subscribe,
@@ -242,15 +303,18 @@ export function useStreamingMessage(
     manager.getState,
   )
 
-  // Process stream when it changes
-  const lastStreamRef = useRef<ReadableStream<Uint8Array> | null>(null)
-
-  if (stream !== lastStreamRef.current) {
-    lastStreamRef.current = stream
+  // Process stream in useEffect (not during render) to avoid React Strict Mode
+  // double-invocation issues and to properly handle cleanup/abort
+  useEffect(() => {
     if (stream) {
-      manager.processStream(stream, options)
+      manager.processStream(stream, optionsRef.current)
     }
-  }
+
+    return () => {
+      // Cancel in-progress reads when stream changes or component unmounts
+      manager.abort()
+    }
+  }, [stream, manager])
 
   return state
 }
